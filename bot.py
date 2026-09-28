@@ -3,7 +3,7 @@ import sqlite3
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
@@ -20,7 +20,6 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 conn = sqlite3.connect('fxbr.db', check_same_thread=False)
 conn.row_factory = sqlite3.Row
-
 conn.execute('''CREATE TABLE IF NOT EXISTS registrations (
  id INTEGER PRIMARY KEY AUTOINCREMENT,
  telegram_id INTEGER NOT NULL,
@@ -66,6 +65,7 @@ def menu_kb(user_id=None):
 
 class Reg(StatesGroup):
     name=State(); uid=State(); ign=State(); payment=State()
+
 class AdminState(StatesGroup):
     room=State(); results=State()
 
@@ -97,7 +97,11 @@ async def reg_ign(message: Message, state: FSMContext):
     await state.update_data(ign=message.text.strip())
     await state.set_state(Reg.payment)
     if os.path.exists(QR_PATH):
-        await message.answer_photo(photo=open(QR_PATH,'rb'), caption=f'💰 Payment ₹{ENTRY_FEE} karo.\n\nPayment ke baad screenshot bhejo.')
+        qr = FSInputFile(QR_PATH)
+        await message.answer_photo(
+            photo=qr,
+            caption=f'💰 Payment ₹{ENTRY_FEE} karo.\n\nPayment ke baad screenshot bhejo.'
+        )
     else:
         await message.answer(f'💰 Payment ₹{ENTRY_FEE} karo.\n\nPayment ke baad screenshot bhejo.')
 
