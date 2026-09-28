@@ -152,14 +152,30 @@ def next_free_slot(round_id):
 
 
 # ---------- MENUS ----------
+PUBLIC_MENU_ITEMS = {
+    "book": "📖 Book",
+    "my": "🎟️ My Booking",
+    "room": "🔐 Room ID & Password",
+    "rules": "📜 Rules",
+    "results": "🏆 Results",
+}
+
+def public_menu_enabled(key):
+    return get_setting("menu_" + key, "1") == "1"
+
 def public_menu(user_id=None):
-    rows = [
-        [KeyboardButton(text="📖 Book")],
-        [KeyboardButton(text="🎟️ My Booking")],
-        [KeyboardButton(text="🔐 Room ID & Password")],
-        [KeyboardButton(text="📜 Rules")],
-        [KeyboardButton(text="🏆 Results")],
-    ]
+    rows = []
+    for key, label in PUBLIC_MENU_ITEMS.items():
+        if not public_menu_enabled(key):
+            continue
+        if key == "results" and user_id != ADMIN_ID:
+            approved_booking = conn.execute(
+                "SELECT id FROM registrations WHERE telegram_id=? AND status='approved' LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if not approved_booking:
+                continue
+        rows.append([KeyboardButton(text=label)])
     if user_id == ADMIN_ID:
         rows.append([KeyboardButton(text="👑 Admin Panel")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -263,6 +279,9 @@ async def main_menu(message: Message, state: FSMContext):
 # ---------- BOOKING ----------
 @dp.message(F.text == "📖 Book")
 async def book_start(message: Message, state: FSMContext):
+    if not public_menu_enabled("book"):
+        await message.answer("🚫 Book option abhi OFF hai.")
+        return
     await state.clear()
     r = active_round()
     if not r:
@@ -428,6 +447,9 @@ async def reg_payment_wrong_type(message: Message):
 # ---------- MY BOOKING ----------
 @dp.message(F.text == "🎟️ My Booking")
 async def my_booking(message: Message):
+    if not public_menu_enabled("my"):
+        await message.answer("🚫 My Booking option abhi OFF hai.")
+        return
     rows = conn.execute(
         "SELECT * FROM registrations WHERE telegram_id=? ORDER BY id DESC LIMIT 20",
         (message.from_user.id,),
@@ -449,6 +471,9 @@ async def my_booking(message: Message):
 # ---------- ROOM ----------
 @dp.message(F.text == "🔐 Room ID & Password")
 async def room_details(message: Message):
+    if not public_menu_enabled("room"):
+        await message.answer("🚫 Room ID & Password option abhi OFF hai.")
+        return
     r = active_round()
     if not r:
         await message.answer("⏳ Abhi koi active match nahi hai.")
@@ -479,6 +504,9 @@ async def room_details(message: Message):
 # ---------- RULES / RESULTS ----------
 @dp.message(F.text == "📜 Rules")
 async def rules(message: Message):
+    if not public_menu_enabled("rules"):
+        await message.answer("🚫 Rules option abhi OFF hai.")
+        return
     default_rules = """📜 <b>RULES 🔥</b>
 
 <b>1️⃣ NO TEAM UP</b>
@@ -518,6 +546,17 @@ Rules follow karo — Fair Play rakho! 🫶"""
 
 @dp.message(F.text == "🏆 Results")
 async def results(message: Message):
+    if not public_menu_enabled("results"):
+        await message.answer("🚫 Results option abhi OFF hai.")
+        return
+    if message.from_user.id != ADMIN_ID:
+        approved_booking = conn.execute(
+            "SELECT id FROM registrations WHERE telegram_id=? AND status='approved' LIMIT 1",
+            (message.from_user.id,),
+        ).fetchone()
+        if not approved_booking:
+            await message.answer("🔒 Results sirf approved/booked players ke liye available hai.")
+            return
     r = active_round()
     text = (r["results"] if r and r["results"] else get_setting("results", ""))
     image_id = (r["results_image_file_id"] if r and r["results_image_file_id"] else get_setting("results_image_file_id", ""))
@@ -729,7 +768,12 @@ async def show_slots(call: CallbackQuery):
         text = f"🎯 MATCH {match_no} — SLOTS {start}-{end}\n"
         for n in range(start, end + 1):
             if n in by_slot:
-                text += f"🟩 Slot {n} — {by_slot[n]['ign']} — UID {by_slot[n]['uid']}\n"
+                username = (by_slot[n]["username"] or "").strip()
+                user_display = f"@{username}" if username else "No Username"
+                text += (
+                    f"🟩 Slot {n} — User: {user_display}\n"
+                    f"   🎮 IGN: {by_slot[n]['ign']} | UID: {by_slot[n]['uid']}\n"
+                )
             else:
                 text += f"⬜ Slot {n} — Empty\n"
         await call.message.answer(text)
@@ -878,31 +922,53 @@ async def activate_match(call: CallbackQuery):
 
 
 # ---------- PUBLIC MENU CONTROL ----------
+def public_menu_control_markup():
+    rows = []
+    for key, label in PUBLIC_MENU_ITEMS.items():
+        status = "ON" if public_menu_enabled(key) else "OFF"
+        rows.append([InlineKeyboardButton(
+            text=f"{label} — {status}",
+            callback_data=f"toggle_menu:{key}"
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 @dp.message(F.text == "🎛️ Manage Public Menu")
 async def public_menu_manage(message: Message):
     if not admin_only(message):
         return
     await message.answer(
-        "🎛️ Public Menu\n\n"
-        "Note: Requested main menu options fixed hain. Neeche status check kar sakte ho.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="📖 Book — ON", callback_data="menuinfo")],
-                [InlineKeyboardButton(text="🎟️ My Booking — ON", callback_data="menuinfo")],
-                [InlineKeyboardButton(text="🔐 Room — ON", callback_data="menuinfo")],
-                [InlineKeyboardButton(text="📜 Rules — ON", callback_data="menuinfo")],
-                [InlineKeyboardButton(text="🏆 Results — ON", callback_data="menuinfo")],
-            ]
-        ),
+        "🎛️ Public Menu ON/OFF\n\n"
+        "Jeta OFF korbe, seta public Main Menu theke hide hoye jabe.\n"
+        "Button-e tap kore ON/OFF change koro.",
+        reply_markup=public_menu_control_markup(),
     )
 
-
-@dp.callback_query(F.data == "menuinfo")
-async def menu_info(call: CallbackQuery):
-    if call.from_user.id == ADMIN_ID:
-        await call.answer("Public menu active hai.")
-    else:
+@dp.callback_query(F.data.startswith("toggle_menu:"))
+async def toggle_public_menu(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
         await call.answer("Not allowed", show_alert=True)
+        return
+    key = call.data.split(":", 1)[1]
+    if key not in PUBLIC_MENU_ITEMS:
+        await call.answer("Invalid option", show_alert=True)
+        return
+    new_value = "0" if public_menu_enabled(key) else "1"
+    set_setting("menu_" + key, new_value)
+    status = "ON" if new_value == "1" else "OFF"
+    await call.answer(f"{PUBLIC_MENU_ITEMS[key]} {status}")
+    try:
+        await call.message.edit_reply_markup(reply_markup=public_menu_control_markup())
+    except Exception:
+        pass
+
+    # Show the updated public keyboard immediately to the admin.
+    try:
+        await call.message.answer(
+            f"✅ {PUBLIC_MENU_ITEMS[key]} {status} ho gaya.",
+            reply_markup=public_menu(call.from_user.id),
+        )
+    except Exception:
+        pass
 
 
 # ---------- STATS ----------
