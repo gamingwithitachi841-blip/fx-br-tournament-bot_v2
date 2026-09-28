@@ -1,220 +1,582 @@
-import os, sqlite3, asyncio
+import os
+import sqlite3
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 
 load_dotenv()
-BOT_TOKEN=os.getenv('BOT_TOKEN','').strip(); ADMIN_ID=int(os.getenv('ADMIN_ID','8628267774')); ENTRY_FEE=30; MAX_SLOTS=48
-QR_PATH=os.path.join(os.path.dirname(__file__),'payment_qr.png')
-if not BOT_TOKEN: raise RuntimeError('BOT_TOKEN is missing')
-bot=Bot(BOT_TOKEN); dp=Dispatcher(); conn=sqlite3.connect('fxbr.db',check_same_thread=False); conn.row_factory=sqlite3.Row
 
-def col(table,name,definition):
-    if name not in [x['name'] for x in conn.execute(f'PRAGMA table_info({table})')]: conn.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
-conn.execute('''CREATE TABLE IF NOT EXISTS registrations(id INTEGER PRIMARY KEY AUTOINCREMENT,telegram_id INTEGER NOT NULL,username TEXT,name TEXT NOT NULL,uid TEXT NOT NULL,ign TEXT NOT NULL,payment_file_id TEXT,status TEXT NOT NULL DEFAULT 'pending',slot INTEGER,match_no INTEGER DEFAULT 1,round_id INTEGER,created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-col('registrations','match_no','INTEGER DEFAULT 1'); col('registrations','round_id','INTEGER')
-conn.execute('''CREATE TABLE IF NOT EXISTS match_rounds(id INTEGER PRIMARY KEY AUTOINCREMENT,match_no INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'active',room_id TEXT DEFAULT '',room_pass TEXT DEFAULT '',results TEXT DEFAULT '',created_at DATETIME DEFAULT CURRENT_TIMESTAMP,completed_at DATETIME)''')
-conn.execute('''CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT)'''); conn.commit()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8628267774"))
+ENTRY_FEE = 30
+QR_PATH = os.path.join(os.path.dirname(__file__), "payment_qr.png")
 
-def setting(k,d=''):
-    r=conn.execute('SELECT value FROM settings WHERE key=?',(k,)).fetchone(); return r['value'] if r else d
-def set_setting(k,v):
-    conn.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(k,str(v))); conn.commit()
-def active(): return conn.execute("SELECT * FROM match_rounds WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
-if not active():
-    conn.execute("INSERT INTO match_rounds(match_no,status) VALUES(1,'active')"); conn.commit()
-def approved(rid): return conn.execute("SELECT COUNT(*) c FROM registrations WHERE round_id=? AND status='approved'",(rid,)).fetchone()['c']
-def reserved(rid): return conn.execute("SELECT COUNT(*) c FROM registrations WHERE round_id=? AND status IN ('pending','approved')",(rid,)).fetchone()['c']
-def free_slot(rid):
-    used={r['slot'] for r in conn.execute("SELECT slot FROM registrations WHERE round_id=? AND status='approved' AND slot IS NOT NULL",(rid,))}
-    return next((n for n in range(1,49) if n not in used),None)
-def menu(uid=None):
-    keys={'book':'📖 Book','my':'🎟️ My Booking','room':'🔐 Room ID & Password','rules':'📜 Rules','results':'🏆 Results'}; rows=[[KeyboardButton(text=v)] for k,v in keys.items() if setting('menu_'+k,'1')=='1']
-    if uid==ADMIN_ID: rows.append([KeyboardButton(text='👑 Admin Panel')])
-    return ReplyKeyboardMarkup(keyboard=rows,resize_keyboard=True)
-def admin_menu():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='🔐 Set Room ID & Password'),KeyboardButton(text='🏆 Set Results')],[KeyboardButton(text='👥 Manage Registrations')],[KeyboardButton(text='🪑 Slot List')],[KeyboardButton(text='🔄 Switch / Allow New Booking')],[KeyboardButton(text='🎛️ Manage Public Menu'),KeyboardButton(text='📊 Registration Stats')],[KeyboardButton(text='⬅️ Main Menu')]],resize_keyboard=True)
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing. Put your BotFather token in Railway Variables.")
 
-class Reg(StatesGroup): name=State(); uid=State(); ign=State(); payment=State()
-class Admin(StatesGroup): room=State(); results=State()
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+conn = sqlite3.connect("fxbr.db", check_same_thread=False)
+conn.execute("""
+CREATE TABLE IF NOT EXISTS registrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id INTEGER,
+    username TEXT,
+    name TEXT,
+    uid TEXT,
+    ign TEXT,
+    status TEXT DEFAULT 'pending',
+    slot INTEGER,
+    screenshot_file_id TEXT,
+    room_id TEXT,
+    room_password TEXT
+)
+""")
+conn.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
+conn.commit()
+
+# Safe migration for an older fxbr.db that does not yet have room columns.
+cols = {r[1] for r in conn.execute("PRAGMA table_info(registrations)").fetchall()}
+if "room_id" not in cols:
+    conn.execute("ALTER TABLE registrations ADD COLUMN room_id TEXT")
+if "room_password" not in cols:
+    conn.execute("ALTER TABLE registrations ADD COLUMN room_password TEXT")
+conn.commit()
+
+PUBLIC_ITEMS = {
+    "register": "📝 Register",
+    "myreg": "🎟️ My Registration",
+    "room": "🔐 Room ID & Password",
+    "rules": "📜 Rules",
+    "results": "🏆 Results",
+}
+DEFAULT_MENU = {key: "1" for key in PUBLIC_ITEMS}
+
+class Reg(StatesGroup):
+    name = State()
+    uid = State()
+    ign = State()
+    payment = State()
+
+class Admin(StatesGroup):
+    room_match = State()
+    room_id = State()
+    room_password = State()
+    results = State()
+
+
+def setting(key, default=None):
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key, value):
+    conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
+    conn.commit()
+
+
+def public_enabled(key):
+    return setting(f"menu_{key}", DEFAULT_MENU.get(key, "1")) == "1"
+
+
+def main_kb(user_id=None):
+    rows = []
+    if public_enabled("register"):
+        rows.append([InlineKeyboardButton(text=PUBLIC_ITEMS["register"], callback_data="register")])
+    if public_enabled("myreg"):
+        rows.append([InlineKeyboardButton(text=PUBLIC_ITEMS["myreg"], callback_data="myreg")])
+    if public_enabled("room"):
+        rows.append([InlineKeyboardButton(text=PUBLIC_ITEMS["room"], callback_data="room")])
+    if public_enabled("rules"):
+        rows.append([InlineKeyboardButton(text=PUBLIC_ITEMS["rules"], callback_data="rules")])
+    if public_enabled("results"):
+        rows.append([InlineKeyboardButton(text=PUBLIC_ITEMS["results"], callback_data="results")])
+    if user_id == ADMIN_ID:
+        rows.append([InlineKeyboardButton(text="👑 Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_kb(reg_id, status):
+    rows = []
+    if status == "pending":
+        rows.append([
+            InlineKeyboardButton(text="✅ Approve", callback_data=f"approve:{reg_id}"),
+            InlineKeyboardButton(text="❌ Reject", callback_data=f"reject:{reg_id}"),
+            InlineKeyboardButton(text="🗑️ Remove", callback_data=f"remove:{reg_id}")
+        ])
+    elif status == "approved":
+        rows.append([
+            InlineKeyboardButton(text="🔐 Set Room", callback_data=f"setroom:{reg_id}"),
+            InlineKeyboardButton(text="🗑️ Remove", callback_data=f"remove:{reg_id}")
+        ])
+    else:
+        rows.append([InlineKeyboardButton(text="🗑️ Remove", callback_data=f"remove:{reg_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_panel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Manage Registrations", callback_data="admin_regs")],
+        [InlineKeyboardButton(text="🔐 Set Room for Match", callback_data="admin_room")],
+        [InlineKeyboardButton(text="🏆 Set Results", callback_data="admin_results")],
+        [InlineKeyboardButton(text="🎛️ Manage Public Menu", callback_data="admin_menu")],
+        [InlineKeyboardButton(text="📊 Registration Stats", callback_data="admin_stats")],
+    ])
+
+
+def admin_menu_kb():
+    rows = []
+    for key, label in PUBLIC_ITEMS.items():
+        state = "ON" if public_enabled(key) else "OFF"
+        rows.append([InlineKeyboardButton(text=f"{label} — {state}", callback_data=f"toggle_menu:{key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Back to Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 @dp.message(CommandStart())
-@dp.message(Command('menu'))
-async def start(m:Message):
-    r=active(); b=approved(r['id']) if r else 0; mn=r['match_no'] if r else 1
-    await m.answer(f'🎮 FX BR SOLO TOURNAMENT 🇮🇳\n\n🎯 Current Match: Match {mn}\n🪑 Slots: {b}/48 booked\n🟢 Available: {48-b}\n\nMenu se option choose karo.',reply_markup=menu(m.from_user.id))
+async def start(message: Message):
+    await message.answer(
+        "🎮 <b>FX BR SOLO TOURNAMENT</b> 🇮🇳\n\n"
+        "💰 Entry Fee: <b>₹30</b>\n"
+        "👤 Mode: <b>Solo</b>\n\n"
+        "Har match ke liye alag se Register kar sakte ho.\n"
+        "Payment approve hone ke baad us match ka slot milega.\n"
+        "Room ID & Password admin usi match ke liye set karega.\n\n"
+        "👇 Neeche menu se option select karo.",
+        reply_markup=main_kb(message.from_user.id), parse_mode="HTML"
+    )
 
-@dp.message(F.text=='📖 Book')
-async def book(m:Message,s:FSMContext):
-    await s.clear(); r=active()
-    if not r: return await m.answer('⏳ Abhi koi active match nahi hai.')
-    old=conn.execute("SELECT id FROM registrations WHERE telegram_id=? AND round_id=? AND status IN ('pending','approved') LIMIT 1",(m.from_user.id,r['id'])).fetchone()
-    if old: return await m.answer('😊 Tum already book karliye ho. Pehle first match khelo, uske baad hi dobara book hoga. 🫶')
-    if reserved(r['id'])>=48: return await m.answer('⏳ Ye match full ho gaya. Next match activate ho raha hai.')
-    await s.set_state(Reg.name); await m.answer(f'📖 Book - Match {r["match_no"]}\n\nEntry Fee: ₹{ENTRY_FEE}\n🪑 Slots: {approved(r["id"])}/48\n\nApna Name bhejo:')
+
+@dp.message(Command("menu"))
+async def menu(message: Message):
+    await message.answer("📋 <b>Main Menu</b>\n\nOption select karo:", reply_markup=main_kb(message.from_user.id), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "register")
+async def register(call: CallbackQuery, state: FSMContext):
+    if not public_enabled("register"):
+        await call.answer("Registration abhi available nahi hai.", show_alert=True)
+        return
+    # IMPORTANT: No duplicate check. Every Register tap creates a NEW match registration.
+    await state.set_state(Reg.name)
+    await call.message.answer("📝 <b>New Match Registration</b>\n\n👤 Apna Name enter karo:", parse_mode="HTML")
+    await call.answer()
+
+
 @dp.message(Reg.name)
-async def rn(m,s): await s.update_data(name=m.text.strip()); await s.set_state(Reg.uid); await m.answer('🎮 Apna Free Fire UID bhejo:')
+async def reg_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await state.set_state(Reg.uid)
+    await message.answer("🆔 Apna Free Fire UID enter karo:")
+
+
 @dp.message(Reg.uid)
-async def ru(m,s): await s.update_data(uid=m.text.strip()); await s.set_state(Reg.ign); await m.answer('👤 Apna In-Game Name (IGN) bhejo:')
+async def reg_uid(message: Message, state: FSMContext):
+    await state.update_data(uid=message.text.strip())
+    await state.set_state(Reg.ign)
+    await message.answer("🎮 Apna In-game Name (IGN) enter karo:")
+
+
 @dp.message(Reg.ign)
-async def ri(m,s):
-    await s.update_data(ign=m.text.strip()); await s.set_state(Reg.payment)
-    if os.path.exists(QR_PATH): await m.answer_photo(FSInputFile(QR_PATH),caption=f'💰 Payment ₹{ENTRY_FEE} karo.\n\nPayment ke baad screenshot bhejo.')
-    else: await m.answer(f'💰 Payment ₹{ENTRY_FEE} karo.\n\nPayment ke baad screenshot bhejo.')
-@dp.message(Reg.payment,F.photo)
-async def rp(m,s):
-    d=await s.get_data(); r=active()
-    if not r or reserved(r['id'])>=48: await s.clear(); return await m.answer('⏳ Match full/change ho gaya. Please dobara Book karo.')
-    if conn.execute("SELECT id FROM registrations WHERE telegram_id=? AND round_id=? AND status IN ('pending','approved')",(m.from_user.id,r['id'])).fetchone(): await s.clear(); return await m.answer('😊 Tum already book karliye ho. Pehle first match khelo, uske baad hi dobara book hoga. 🫶')
-    cur=conn.execute("INSERT INTO registrations(telegram_id,username,name,uid,ign,payment_file_id,status,match_no,round_id) VALUES(?,?,?,?,?,?,?,?,?)",(m.from_user.id,m.from_user.username or '',d['name'],d['uid'],d['ign'],m.photo[-1].file_id,'pending',r['match_no'],r['id'])); rid=cur.lastrowid; conn.commit(); await s.clear()
-    await m.answer(f'✅ Booking submit ho gayi!\n🎯 Match: {r["match_no"]}\n🆔 Registration ID: #{rid}\n\nAdmin approval ka wait karo.',reply_markup=menu(m.from_user.id))
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Approve',callback_data=f'app:{rid}'),InlineKeyboardButton(text='❌ Reject',callback_data=f'rej:{rid}')],[InlineKeyboardButton(text='🗑️ Remove',callback_data=f'rem:{rid}')]])
-    await bot.send_photo(ADMIN_ID,m.photo[-1].file_id,caption=f'🆕 New Booking #{rid}\n\n🎯 Match: {r["match_no"]}\nName: {d["name"]}\nUID: {d["uid"]}\nIGN: {d["ign"]}\nUser: @{m.from_user.username or "NoUsername"}',reply_markup=kb)
+async def reg_ign(message: Message, state: FSMContext):
+    await state.update_data(ign=message.text.strip())
+    await state.set_state(Reg.payment)
+    if os.path.exists(QR_PATH):
+        await message.answer_photo(
+            FSInputFile(QR_PATH),
+            caption="💰 Entry Fee: ₹30\n\nIs QR se payment karo, phir <b>payment screenshot</b> yahan bhejo.",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("💰 Entry Fee: ₹30\nPayment karke screenshot yahan bhejo.")
+
+
+@dp.message(Reg.payment, F.photo)
+async def reg_payment(message: Message, state: FSMContext):
+    data = await state.get_data()
+    file_id = message.photo[-1].file_id
+    cur = conn.execute(
+        "INSERT INTO registrations (telegram_id,username,name,uid,ign,screenshot_file_id,status) VALUES (?,?,?,?,?,?,?)",
+        (message.from_user.id, message.from_user.username or "", data["name"], data["uid"], data["ign"], file_id, "pending")
+    )
+    reg_id = cur.lastrowid
+    conn.commit()
+    await state.clear()
+
+    await message.answer(
+        f"✅ Payment screenshot mil gaya!\n\n🆕 <b>Match Registration #{reg_id}</b>\n"
+        "⏳ Abhi admin payment verify karega.\n"
+        "Approval ke baad is match ka slot milega.\n"
+        "Room ID & Password isi match ke liye baad mein milega.",
+        reply_markup=main_kb(message.from_user.id), parse_mode="HTML"
+    )
+
+    admin_text = (
+        f"🆕 <b>NEW MATCH REGISTRATION #{reg_id}</b>\n\n"
+        f"👤 Name: {data['name']}\n"
+        f"🎮 IGN: {data['ign']}\n"
+        f"🆔 UID: {data['uid']}\n"
+        f"📱 Username: @{message.from_user.username or 'N/A'}\n"
+        f"💰 Fee: ₹30"
+    )
+    await bot.send_photo(ADMIN_ID, file_id, caption=admin_text, parse_mode="HTML", reply_markup=admin_kb(reg_id, "pending"))
+
+
 @dp.message(Reg.payment)
-async def rpw(m): await m.answer('❗ Payment screenshot image bhejo, please.')
+async def payment_wrong(message: Message):
+    await message.answer("📷 Payment screenshot/photo bhejo.")
 
-@dp.message(F.text=='🎟️ My Booking')
-async def my(m):
-    rows=conn.execute('SELECT * FROM registrations WHERE telegram_id=? ORDER BY id DESC LIMIT 10',(m.from_user.id,)).fetchall()
-    if not rows:return await m.answer('❌ Abhi koi booking nahi hai.')
-    await m.answer('🎟️ Tumhari Bookings:\n\n'+'\n'.join(f'🆔 #{r["id"]} | 🎯 Match {r["match_no"]} | {r["status"].upper()} | 🎟️ Slot {r["slot"] or "-"}\n👤 {r["ign"]}' for r in rows))
-@dp.message(F.text=='🔐 Room ID & Password')
-async def room(m):
-    r=active()
-    if not r:return await m.answer('⏳ Abhi koi active match nahi hai.')
-    if not conn.execute("SELECT id FROM registrations WHERE telegram_id=? AND round_id=? AND status='approved'",(m.from_user.id,r['id'])).fetchone():return await m.answer('🔒 Pehle current match ka payment approve hona zaroori hai.')
-    rid=r['room_id'] or setting('room_id'); pw=r['room_pass'] or setting('room_pass')
-    await m.answer(f'🔐 ROOM DETAILS - MATCH {r["match_no"]}\n\n🆔 Room ID: {rid}\n🔑 Password: {pw}' if rid and pw else '⏳ Room ID & Password abhi publish nahi hua. Wait karo.')
-@dp.message(F.text=='📜 Rules')
-async def rules(m): await m.answer('📜 RULES\n\n1. No team up — team up karoge to no prize, no refund.\n2. No revive.\n3. E-sports mode ON.\n4. Random kill = no prize.\n5. Jisko jo slot milega, usi slot par rahega.\n6. All guns & character skills allowed.\n7. Network ya kisi bhi issue par management ka decision final hai.')
-@dp.message(F.text=='🏆 Results')
-async def results(m):
-    r=active(); await m.answer((r['results'] if r and r['results'] else setting('results','🏆 Results abhi publish nahi hua.')))
 
-async def switch_if_full():
-    r=active()
-    if not r or reserved(r['id'])<48:return
-    nxt=2 if r['match_no']==1 else 1
-    conn.execute("UPDATE match_rounds SET status='completed',completed_at=CURRENT_TIMESTAMP WHERE id=?",(r['id'],)); conn.execute("INSERT INTO match_rounds(match_no,status) VALUES(?,'active')",(nxt,)); conn.commit()
-    try: await bot.send_message(ADMIN_ID,f'🔄 Match {r["match_no"]} ke 48 slots full. ✅ Match {nxt} active hai.')
-    except: pass
+@dp.callback_query(F.data.startswith("approve:"))
+async def approve(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Sirf admin use kar sakta hai.", show_alert=True)
+        return
+    reg_id = int(call.data.split(":")[1])
+    row = conn.execute("SELECT telegram_id,status FROM registrations WHERE id=?", (reg_id,)).fetchone()
+    if not row or row[1] != "pending":
+        await call.answer("Registration nahi mili ya pehle hi process ho chuki hai.", show_alert=True)
+        return
+    # Slot numbers are assigned globally to approved registrations. A new registration gets a new slot.
+    slot = conn.execute("SELECT COALESCE(MAX(slot),0)+1 FROM registrations WHERE status='approved'").fetchone()[0]
+    conn.execute("UPDATE registrations SET status='approved',slot=? WHERE id=?", (slot, reg_id))
+    conn.commit()
+    await bot.send_message(
+        row[0],
+        f"🎉 <b>Payment Approved!</b>\n\n🆕 Match: <b>#{reg_id}</b>\n🎟️ Tumhara Slot: <b>{slot}</b>\n\n"
+        "🔐 Is match ka Room ID & Password admin set karne ke baad isi bot mein milega.",
+        parse_mode="HTML", reply_markup=main_kb(row[0])
+    )
+    await call.message.edit_reply_markup(reply_markup=admin_kb(reg_id, "approved"))
+    await call.answer("Approved ✅")
 
-@dp.message(F.text=='👑 Admin Panel')
-async def ap(m):
-    if m.from_user.id!=ADMIN_ID:return
-    r=active(); await m.answer(f'👑 Admin Panel\n\n🎯 Active Match: {r["match_no"]}\n🪑 Approved: {approved(r["id"])}/48',reply_markup=admin_menu())
-@dp.message(F.text=='⬅️ Main Menu')
-async def mm(m): await m.answer('Main Menu',reply_markup=menu(m.from_user.id))
 
-@dp.message(F.text=='🔐 Set Room ID & Password')
-async def sr(m,s):
-    if m.from_user.id==ADMIN_ID: await s.set_state(Admin.room); await m.answer('Room ID aur Password ek line me bhejo. Example:\n12345678 1234')
-@dp.message(Admin.room)
-async def srs(m,s):
-    if m.from_user.id!=ADMIN_ID:return
-    p=m.text.split(maxsplit=1)
-    if len(p)<2:return await m.answer('Format: ROOMID PASSWORD')
-    r=active(); conn.execute('UPDATE match_rounds SET room_id=?,room_pass=? WHERE id=?',(p[0],p[1],r['id'])); conn.commit(); set_setting('room_id',p[0]); set_setting('room_pass',p[1]); await s.clear(); await m.answer(f'✅ Match {r["match_no"]} ka Room ID & Password save ho gaya.')
-@dp.message(F.text=='🏆 Set Results')
-async def srst(m,s):
-    if m.from_user.id==ADMIN_ID: await s.set_state(Admin.results); await m.answer('Results ka text bhejo:')
+@dp.callback_query(F.data.startswith("reject:"))
+async def reject(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Sirf admin use kar sakta hai.", show_alert=True)
+        return
+    reg_id = int(call.data.split(":")[1])
+    row = conn.execute("SELECT telegram_id,status FROM registrations WHERE id=?", (reg_id,)).fetchone()
+    if not row:
+        await call.answer("Registration nahi mili.", show_alert=True)
+        return
+    conn.execute("UPDATE registrations SET status='rejected' WHERE id=?", (reg_id,))
+    conn.commit()
+    await bot.send_message(row[0], f"❌ Match #{reg_id} ka payment/registration reject ho gaya hai. Admin se contact karo.")
+    await call.message.edit_reply_markup(reply_markup=admin_kb(reg_id, "rejected"))
+    await call.answer("Rejected ❌")
+
+
+@dp.callback_query(F.data.startswith("remove:"))
+async def remove_registration(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Sirf admin use kar sakta hai.", show_alert=True)
+        return
+    reg_id = int(call.data.split(":")[1])
+    row = conn.execute("SELECT telegram_id,status,slot FROM registrations WHERE id=?", (reg_id,)).fetchone()
+    if not row:
+        await call.answer("Registration already removed.", show_alert=True)
+        return
+    conn.execute("DELETE FROM registrations WHERE id=?", (reg_id,))
+    conn.commit()
+    try:
+        await bot.send_message(
+            row[0],
+            f"🗑️ <b>Match #{reg_id}</b> ki tumhari registration admin ne remove kar di hai.\n\n"
+            "Ab tum chaaho to <b>Register</b> karke new match join kar sakte ho.",
+            reply_markup=main_kb(row[0]), parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.answer("Registration removed 🗑️")
+
+
+@dp.callback_query(F.data.startswith("setroom:"))
+async def set_room_for_match(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Sirf admin use kar sakta hai.", show_alert=True)
+        return
+    reg_id = int(call.data.split(":")[1])
+    row = conn.execute("SELECT status FROM registrations WHERE id=?", (reg_id,)).fetchone()
+    if not row or row[0] != "approved":
+        await call.answer("Pehle registration approve karo.", show_alert=True)
+        return
+    await state.update_data(room_match=reg_id)
+    await state.set_state(Admin.room_id)
+    await call.message.answer(f"🔐 Match <b>#{reg_id}</b> ke liye Room ID bhejo:", parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "myreg")
+async def myreg(call: CallbackQuery):
+    rows = conn.execute(
+        "SELECT id,name,uid,ign,status,slot,room_id,room_password FROM registrations WHERE telegram_id=? ORDER BY id DESC LIMIT 10",
+        (call.from_user.id,)
+    ).fetchall()
+    if not rows:
+        await call.message.answer("Tumhari abhi koi registration nahi hai.", reply_markup=main_kb(call.from_user.id))
+    else:
+        lines = ["🎟️ <b>Tumhari Registrations</b>\n"]
+        for r in rows:
+            room_state = "Room set hai" if r[6] and r[7] else "Room pending"
+            lines.append(
+                f"🆕 Match <b>#{r[0]}</b>\n"
+                f"👤 {r[1]} | 🎮 {r[3]}\n"
+                f"📌 Status: <b>{r[4]}</b> | 🎟️ Slot: <b>{r[5] or '-'} </b>\n"
+                f"🔐 {room_state}\n"
+            )
+        await call.message.answer("\n".join(lines), reply_markup=main_kb(call.from_user.id), parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "room")
+async def room(call: CallbackQuery):
+    # Show the latest approved match that has its own room credentials.
+    row = conn.execute(
+        "SELECT id,slot,room_id,room_password FROM registrations "
+        "WHERE telegram_id=? AND status='approved' AND room_id IS NOT NULL AND room_id!='' "
+        "AND room_password IS NOT NULL AND room_password!='' ORDER BY id DESC LIMIT 1",
+        (call.from_user.id,)
+    ).fetchone()
+    if not row:
+        approved = conn.execute(
+            "SELECT id FROM registrations WHERE telegram_id=? AND status='approved' ORDER BY id DESC LIMIT 1",
+            (call.from_user.id,)
+        ).fetchone()
+        if approved:
+            await call.message.answer(f"⏳ Match #{approved[0]} approved hai, lekin uska Room ID & Password abhi admin ne set nahi kiya hai.")
+        else:
+            await call.message.answer("🔒 Pehle tumhari registration/payment approve hona zaroori hai.")
+        await call.answer()
+        return
+    await call.message.answer(
+        f"🔐 <b>Match #{row[0]}</b>\n\n"
+        f"🎟️ Slot: <b>{row[1]}</b>\n"
+        f"🆔 Room ID: <code>{row[2]}</code>\n"
+        f"🔑 Password: <code>{row[3]}</code>",
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "rules")
+async def rules(call: CallbackQuery):
+    await call.message.answer(
+        "📜 <b>FX BR SOLO RULES</b>\n\n"
+        "1. Team up mat karo — team up kiya to no prize/no refund.\n"
+        "2. Revive allowed nahi hai.\n"
+        "3. E-sports mode ON rahega.\n"
+        "4. Random kill kiya to no prize.\n"
+        "5. Jo slot milega usi slot par raho, warna kick/no refund.\n"
+        "6. All guns aur all character skills allowed hain.\n"
+        "7. Network ya personal issue ke liye management responsible nahi hai.",
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "results")
+async def results(call: CallbackQuery):
+    text = setting("results")
+    await call.message.answer(text if text else "🏆 Abhi results publish nahi hue hain. Thoda wait karo.")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "admin_panel")
+async def admin_panel(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Sirf admin use kar sakta hai.", show_alert=True)
+        return
+    await call.message.answer("👑 <b>FX BR ADMIN PANEL</b>\n\nKya manage karna hai, option select karo:", reply_markup=admin_panel_kb(), parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "admin_room")
+async def admin_room(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Sirf admin use kar sakta hai.", show_alert=True)
+        return
+    approved = conn.execute(
+        "SELECT id,name,ign,slot FROM registrations WHERE status='approved' ORDER BY id DESC LIMIT 20"
+    ).fetchall()
+    if not approved:
+        await call.message.answer("❌ Abhi koi approved match nahi hai.", reply_markup=admin_panel_kb())
+        await call.answer()
+        return
+    rows = []
+    for r in approved:
+        rows.append([InlineKeyboardButton(text=f"Match #{r[0]} | {r[1]} | Slot {r[3] or '-'}", callback_data=f"setroom:{r[0]}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="admin_panel")])
+    await call.message.answer("🔐 Jis match ka Room ID & Password set karna hai, woh select karo:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.message(Admin.room_id)
+async def admin_room_id(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    reg_id = data.get("room_match")
+    if not reg_id:
+        await state.clear()
+        await message.answer("❌ Match select nahi hua. Admin Panel se phir try karo.")
+        return
+    await state.update_data(room_id=message.text.strip())
+    await state.set_state(Admin.room_password)
+    await message.answer(f"🔑 Match <b>#{reg_id}</b> ka Room Password bhejo:", parse_mode="HTML")
+
+
+@dp.message(Admin.room_password)
+async def admin_room_password(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    reg_id = data.get("room_match")
+    room_id = data.get("room_id")
+    password = message.text.strip()
+    if not reg_id or not room_id:
+        await state.clear()
+        await message.answer("❌ Match details missing hain. Admin Panel se phir try karo.")
+        return
+    row = conn.execute("SELECT telegram_id,status FROM registrations WHERE id=?", (reg_id,)).fetchone()
+    if not row or row[1] != "approved":
+        await state.clear()
+        await message.answer("❌ Ye match approved nahi hai ya remove ho chuka hai.")
+        return
+    conn.execute("UPDATE registrations SET room_id=?, room_password=? WHERE id=?", (room_id, password, reg_id))
+    conn.commit()
+    await state.clear()
+    await bot.send_message(
+        row[0],
+        f"🔐 <b>Room ID & Password Ready!</b>\n\n🆕 Match: <b>#{reg_id}</b>\n"
+        f"🆔 Room ID: <code>{room_id}</code>\n🔑 Password: <code>{password}</code>",
+        parse_mode="HTML", reply_markup=main_kb(row[0])
+    )
+    await message.answer(
+        f"✅ Match <b>#{reg_id}</b> ka Room ID & Password save ho gaya.\n\n"
+        f"🆔 {room_id}\n🔑 {password}\n\nPlayer ko bhi send kar diya gaya hai.",
+        reply_markup=admin_panel_kb(), parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "admin_results")
+async def admin_results(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Sirf admin use kar sakta hai.", show_alert=True)
+        return
+    await state.set_state(Admin.results)
+    await call.message.answer("🏆 Jo result publish karna hai woh yahan bhejo.\n\nExample:\n<code>🥇 1st - Player A\n🥈 2nd - Player B\n🥉 3rd - Player C</code>", parse_mode="HTML")
+    await call.answer()
+
+
 @dp.message(Admin.results)
-async def srss(m,s):
-    if m.from_user.id!=ADMIN_ID:return
-    r=active(); conn.execute('UPDATE match_rounds SET results=? WHERE id=?',(m.text,r['id'])); conn.commit(); set_setting('results',m.text); await s.clear(); await m.answer('✅ Results save ho gaya.')
+async def admin_results_text(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    set_setting("results", message.text.strip())
+    await state.clear()
+    await message.answer("✅ <b>Results successfully publish ho gaye!</b>", reply_markup=admin_panel_kb(), parse_mode="HTML")
 
-@dp.message(F.text=='👥 Manage Registrations')
-async def manage(m):
-    if m.from_user.id!=ADMIN_ID:return
-    rows=conn.execute('SELECT * FROM registrations ORDER BY id DESC LIMIT 30').fetchall()
-    if not rows:return await m.answer('Koi registration nahi hai.')
-    for r in rows:
-        kb=[]
-        if r['status']=='pending':kb=[[InlineKeyboardButton(text='✅ Approve',callback_data=f'app:{r["id"]}'),InlineKeyboardButton(text='❌ Reject',callback_data=f'rej:{r["id"]}')]]
-        kb.append([InlineKeyboardButton(text='🗑️ Remove',callback_data=f'rem:{r["id"]}')])
-        await m.answer(f'#{r["id"]} | {r["status"].upper()} | Match {r["match_no"]} | Slot {r["slot"] or "-"}\n👤 {r["name"]}\n🎮 UID: {r["uid"]}\nIGN: {r["ign"]}',reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@dp.message(F.text=='🪑 Slot List')
-async def sl(m):
-    if m.from_user.id==ADMIN_ID: await m.answer('🪑 Slot List',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🎯 Match 1',callback_data='slots:1')],[InlineKeyboardButton(text='🎯 Match 2',callback_data='slots:2')]]))
-@dp.callback_query(F.data.startswith('slots:'))
-async def slots(c):
-    if c.from_user.id!=ADMIN_ID:return await c.answer('Not allowed')
-    mn=int(c.data.split(':')[1]); r=conn.execute('SELECT * FROM match_rounds WHERE match_no=? ORDER BY id DESC LIMIT 1',(mn,)).fetchone(); by={}
-    if r:
-        by={x['slot']:x for x in conn.execute("SELECT * FROM registrations WHERE round_id=? AND status='approved'",(r['id'],)).fetchall() if x['slot']}
-    for st in range(1,49,12):
-        txt=f'🎯 MATCH {mn} — SLOTS {st}-{min(st+11,48)}\n'+'\n'.join(f'🪑 Slot {n} — {by[n]["ign"]} — UID {by[n]["uid"]}' if n in by else f'⬜ Slot {n} — Empty' for n in range(st,min(st+11,48)+1)); await c.message.answer(txt)
-    btn=[[InlineKeyboardButton(text=f'🗑️ Delete Slot {n}',callback_data=f'dslot:{r["id"]}:{n}')] for n in sorted(by)] if r else []
-    btn.append([InlineKeyboardButton(text=f'🗑️ Clear Match {mn}',callback_data=f'clearask:{mn}')]); await c.message.answer(f'🎯 Match {mn} controls:',reply_markup=InlineKeyboardMarkup(inline_keyboard=btn)); await c.answer()
-@dp.callback_query(F.data.startswith('dslot:'))
-async def ds(c):
-    if c.from_user.id!=ADMIN_ID:return await c.answer('Not allowed')
-    _,rid,n=c.data.split(':'); row=conn.execute("SELECT * FROM registrations WHERE round_id=? AND slot=? AND status='approved'",(int(rid),int(n))).fetchone()
-    if not row:return await c.answer('Slot already empty')
-    conn.execute('DELETE FROM registrations WHERE id=?',(row['id'],)); conn.commit(); await c.answer(f'Slot {n} deleted'); await c.message.edit_reply_markup(reply_markup=None)
-@dp.callback_query(F.data.startswith('clearask:'))
-async def ca(c):
-    if c.from_user.id!=ADMIN_ID:return await c.answer('Not allowed')
-    mn=int(c.data.split(':')[1]); await c.message.answer(f'⚠️ Match {mn} ka slot list clear karna hai?',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Yes, Clear',callback_data=f'clear:{mn}'),InlineKeyboardButton(text='❌ Cancel',callback_data='cancelclear')]])); await c.answer()
-@dp.callback_query(F.data=='cancelclear')
-async def cc(c): await c.message.edit_text('❌ Clear cancel.'); await c.answer()
-@dp.callback_query(F.data.startswith('clear:'))
-async def clr(c):
-    if c.from_user.id!=ADMIN_ID:return await c.answer('Not allowed')
-    mn=int(c.data.split(':')[1]); r=conn.execute('SELECT * FROM match_rounds WHERE match_no=? ORDER BY id DESC LIMIT 1',(mn,)).fetchone()
-    if r: conn.execute('DELETE FROM registrations WHERE round_id=?',(r['id'],)); conn.commit()
-    await c.message.edit_text(f'✅ Match {mn} ka slot list clear ho gaya. Slot 1-48 fresh available.'); await c.answer()
+@dp.callback_query(F.data == "admin_regs")
+async def admin_regs(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Sirf admin use kar sakta hai.", show_alert=True)
+        return
+    rows = conn.execute("SELECT id,name,uid,ign,status,slot,room_id FROM registrations ORDER BY id DESC LIMIT 30").fetchall()
+    if not rows:
+        await call.message.answer("👥 <b>Registrations</b>\n\nAbhi koi registration nahi hai.", reply_markup=admin_panel_kb(), parse_mode="HTML")
+    else:
+        await call.message.answer("👥 <b>All Match Registrations</b>\n\nHar Register = new match registration. Approved match ke liye Set Room bhi kar sakte ho. Remove karne par public user ki woh registration delete ho jayegi.", reply_markup=admin_panel_kb(), parse_mode="HTML")
+        for r in rows:
+            reg_id, name, uid, ign, status, slot, room_id = r
+            room_state = "🔐 Room Set" if room_id else "⏳ Room Pending"
+            await call.message.answer(
+                f"🆕 <b>Match #{reg_id}</b>\n👤 {name}\n🎮 {ign}\n🆔 {uid}\n📌 {status}\n🎟️ Slot: {slot or '-'}\n{room_state}",
+                reply_markup=admin_kb(reg_id, status), parse_mode="HTML"
+            )
+    await call.answer()
 
-@dp.message(F.text=='🔄 Switch / Allow New Booking')
-async def sm(m):
-    if m.from_user.id==ADMIN_ID: await m.answer('🔄 Active match select karo:',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🎯 Activate Match 1',callback_data='activate:1')],[InlineKeyboardButton(text='🎯 Activate Match 2',callback_data='activate:2')]]))
-@dp.callback_query(F.data.startswith('activate:'))
-async def act(c):
-    if c.from_user.id!=ADMIN_ID:return await c.answer('Not allowed')
-    mn=int(c.data.split(':')[1]); old=active()
-    if old and old['match_no']==mn:return await c.answer('Already active')
-    if old: conn.execute("UPDATE match_rounds SET status='completed',completed_at=CURRENT_TIMESTAMP WHERE id=?",(old['id'],))
-    conn.execute("INSERT INTO match_rounds(match_no,status) VALUES(?,'active')",(mn,)); conn.commit(); await c.message.answer(f'✅ Match {mn} active ho gaya. Slots 0/48.'); await c.answer()
 
-@dp.message(F.text=='🎛️ Manage Public Menu')
-async def mp(m):
-    if m.from_user.id!=ADMIN_ID:return
-    labels={'book':'📖 Book','my':'🎟️ My Booking','room':'🔐 Room ID & Password','rules':'📜 Rules','results':'🏆 Results'}
-    await m.answer('🎛️ Public Menu ON/OFF',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f'{v} — {"ON" if setting("menu_"+k,"1")=="1" else "OFF"}',callback_data=f'toggle:{k}')] for k,v in labels.items()]))
-@dp.callback_query(F.data.startswith('toggle:'))
-async def tog(c):
-    if c.from_user.id!=ADMIN_ID:return await c.answer('Not allowed')
-    k=c.data.split(':')[1]; set_setting('menu_'+k,'0' if setting('menu_'+k,'1')=='1' else '1'); await c.answer('Updated')
-@dp.message(F.text=='📊 Registration Stats')
-async def stats(m):
-    if m.from_user.id!=ADMIN_ID:return
-    r=active(); await m.answer(f'📊 Stats\n\n🎯 Active Match: {r["match_no"]}\n🪑 Approved: {approved(r["id"])}/48\n📌 Approved + Pending: {reserved(r["id"])}/48\n\nTotal: {conn.execute("SELECT COUNT(*) c FROM registrations").fetchone()["c"]}')
+@dp.callback_query(F.data == "admin_menu")
+async def admin_menu(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Sirf admin use kar sakta hai.", show_alert=True)
+        return
+    await call.message.answer("🎛️ <b>Public Menu Management</b>\n\nON/OFF karke public menu control karo:", reply_markup=admin_menu_kb(), parse_mode="HTML")
+    await call.answer()
 
-@dp.callback_query(F.data.startswith('app:'))
-async def app(c):
-    if c.from_user.id!=ADMIN_ID:return await c.answer('Not allowed')
-    rid=int(c.data.split(':')[1]); row=conn.execute('SELECT * FROM registrations WHERE id=?',(rid,)).fetchone(); r=active()
-    if not row:return await c.answer('Not found')
-    if row['status']!='pending':return await c.answer('Already processed')
-    if not r or row['round_id']!=r['id']: conn.execute("UPDATE registrations SET status='rejected' WHERE id=?",(rid,)); conn.commit(); await c.answer('Old match'); return
-    if approved(r['id'])>=48:return await c.answer('48 slots full')
-    slot=free_slot(r['id']); conn.execute("UPDATE registrations SET status='approved',slot=? WHERE id=?",(slot,rid)); conn.commit(); await c.answer('Approved'); await c.message.edit_reply_markup(reply_markup=None); await bot.send_message(row['telegram_id'],f'✅ Payment Approved!\n\n🎯 Match: {r["match_no"]}\n🎟️ Tumhara Slot: {slot}\n\nRoom ID & Password publish hone ke baad tumhe mil jayega.'); await switch_if_full()
-@dp.callback_query(F.data.startswith('rej:'))
-async def rej(c):
-    if c.from_user.id!=ADMIN_ID:return await c.answer('Not allowed')
-    rid=int(c.data.split(':')[1]); row=conn.execute('SELECT * FROM registrations WHERE id=?',(rid,)).fetchone()
-    if not row:return await c.answer('Not found')
-    conn.execute("UPDATE registrations SET status='rejected' WHERE id=?",(rid,)); conn.commit(); await c.answer('Rejected'); await c.message.edit_reply_markup(reply_markup=None); await bot.send_message(row['telegram_id'],'❌ Payment reject ho gaya. Zarurat ho to dobara Book karo.')
-@dp.callback_query(F.data.startswith('rem:'))
-async def rem(c):
-    if c.from_user.id!=ADMIN_ID:return await c.answer('Not allowed')
-    rid=int(c.data.split(':')[1]); row=conn.execute('SELECT * FROM registrations WHERE id=?',(rid,)).fetchone()
-    if not row:return await c.answer('Already removed')
-    conn.execute('DELETE FROM registrations WHERE id=?',(rid,)); conn.commit(); await c.answer('Removed'); await c.message.edit_reply_markup(reply_markup=None); await bot.send_message(row['telegram_id'],'🗑️ Tumhari booking admin ne remove kar di hai. Zarurat ho to dobara Book karo.')
 
-async def main(): await dp.start_polling(bot)
-if __name__=='__main__': asyncio.run(main())
+@dp.callback_query(F.data.startswith("toggle_menu:"))
+async def toggle_menu(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Sirf admin use kar sakta hai.", show_alert=True)
+        return
+    key = call.data.split(":", 1)[1]
+    if key not in PUBLIC_ITEMS:
+        await call.answer("Invalid option.", show_alert=True)
+        return
+    new_value = "0" if public_enabled(key) else "1"
+    set_setting(f"menu_{key}", new_value)
+    await call.message.edit_reply_markup(reply_markup=admin_menu_kb())
+    await call.answer(f"{PUBLIC_ITEMS[key]} {'ON' if new_value == '1' else 'OFF'}")
+
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Sirf admin use kar sakta hai.", show_alert=True)
+        return
+    total = conn.execute("SELECT COUNT(*) FROM registrations").fetchone()[0]
+    pending = conn.execute("SELECT COUNT(*) FROM registrations WHERE status='pending'").fetchone()[0]
+    approved = conn.execute("SELECT COUNT(*) FROM registrations WHERE status='approved'").fetchone()[0]
+    rejected = conn.execute("SELECT COUNT(*) FROM registrations WHERE status='rejected'").fetchone()[0]
+    await call.message.answer(
+        f"📊 <b>Registration Stats</b>\n\nTotal: {total}\n⏳ Pending: {pending}\n✅ Approved: {approved}\n❌ Rejected: {rejected}",
+        reply_markup=admin_panel_kb(), parse_mode="HTML"
+    )
+    await call.answer()
+
+
+# Backup command: choose a match from Admin Panel for match-specific Room ID/Password.
+@dp.message(F.text.startswith("/setroom "))
+async def setroom(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("🔐 Ab Admin Panel → Set Room for Match use karo, taaki har match ka alag Room ID & Password rahe.")
+
+
+@dp.message(F.text.startswith("/setresults "))
+async def setresults(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    set_setting("results", message.text[len("/setresults "):].strip())
+    await message.answer("🏆 Results update ho gaye.")
+
+
+@dp.message(Command("admin"))
+async def admin(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("👑 <b>FX BR ADMIN PANEL</b>\n\nKya manage karna hai, option select karo:", reply_markup=admin_panel_kb(), parse_mode="HTML")
+
+
+async def main():
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
