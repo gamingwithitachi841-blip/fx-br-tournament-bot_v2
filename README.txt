@@ -1,28 +1,17 @@
-# FX BR Solo Tournament Telegram Bot
+FX BR Solo Telegram Tournament Bot - Hinglish Admin Edition
 
-Standalone Telegram bot. No website required.
+Features:
+- /start and /menu commands
+- Public menu: Register, My Registration, Room ID & Password, Rules, Results
+- Admin-only panel locked to ADMIN_ID
+- Admin can manage public menu ON/OFF
+- Admin can approve, reject, or remove registrations
+- Admin can set Room ID & Password
+- Admin can publish Results
+- Admin registration stats and recent registrations
+- Payment QR included
 
-Configured:
-- Mode: Solo
-- Entry fee: ₹30
-- Admin Telegram ID: 8628267774
-- Payment QR: payment_qr.png
-- Payment screenshot approval
-- Slot assignment
-- Room ID & Password locked to approved players
-- Rules and results
-
-## Run
-1. Install Python 3.10+.
-2. Copy `.env.example` to `.env`.
-3. Put your BotFather token in `.env`.
-4. Run:
-   pip install -r requirements.txt
-   python bot.py
-
-## Admin commands
-/admin
-/setroom ROOM_ID PASSWORD
-/setresults YOUR_RESULT
-
-Never share your BotFather token publicly.
+Railway:
+1. Add BOT_TOKEN in Variables.
+2. ADMIN_ID defaults to 8628267774.
+3. Deploy with Python requirements.
