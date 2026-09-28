@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS match_rounds (
     room_id TEXT DEFAULT '',
     room_pass TEXT DEFAULT '',
     results TEXT DEFAULT '',
+    results_image_file_id TEXT DEFAULT '',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     completed_at DATETIME
 )
@@ -78,6 +79,7 @@ def ensure_column(table, column, definition):
 ensure_column("registrations", "payment_file_id", "TEXT")
 ensure_column("registrations", "match_no", "INTEGER DEFAULT 1")
 ensure_column("registrations", "round_id", "INTEGER")
+ensure_column("match_rounds", "results_image_file_id", "TEXT")
 
 conn.commit()
 
@@ -167,6 +169,7 @@ def admin_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔐 Set Room ID & Password"), KeyboardButton(text="🏆 Set Results")],
+            [KeyboardButton(text="📜 Set Rules")],
             [KeyboardButton(text="👥 Manage Registrations")],
             [KeyboardButton(text="🪑 Slot List")],
             [KeyboardButton(text="🔄 Switch / Allow New Booking")],
@@ -188,6 +191,7 @@ class Reg(StatesGroup):
 class Admin(StatesGroup):
     room = State()
     results = State()
+    rules = State()
 
 
 # ---------- HELPERS ----------
@@ -475,25 +479,56 @@ async def room_details(message: Message):
 # ---------- RULES / RESULTS ----------
 @dp.message(F.text == "📜 Rules")
 async def rules(message: Message):
-    await message.answer(
-        "📜 RULES\n\n"
-        "1. No team up — team up karoge to no prize, no refund.\n"
-        "2. No revive.\n"
-        "3. E-sports mode ON.\n"
-        "4. Random kill = no prize.\n"
-        "5. Jisko jo slot milega, usi slot par rahega.\n"
-        "6. All guns & character skills allowed.\n"
-        "7. Network ya kisi bhi issue par management ka decision final hai."
-    )
+    default_rules = """📜 <b>RULES 🔥</b>
+
+<b>1️⃣ NO TEAM UP</b>
+Team up karoge → <b>NO PRIZE + NO REFUND</b> ❌
+
+<b>2️⃣ NO REVIVE</b>
+Revive karna allowed nahi hai. ❌
+
+<b>3️⃣ E-SPORTS MODE</b>
+Game mein <b>E-SPORTS MODE ON rahega.</b> 🎮🔥
+
+<b>4️⃣ RANDOM KILL</b>
+Random kill = <b>NO PRIZE</b> ❌
+
+<b>5️⃣ SLOT RULE</b>
+Jisko jo slot milega, usi slot par rahega, warna <b>KICK</b> hoga — refund bhi nahi hoga. ❌
+
+<b>6️⃣ GUNS & CHARACTER SKILLS</b>
+All guns & character skills allowed. 🔥
+
+<b>7️⃣ NETWORK / OTHER ISSUE</b>
+Network ya kisi bhi issue par koi jimmedaar nahi hoga. ⚠️
+
+<b>8️⃣ DOUBT / PROOF</b>
+Kisi ke upar koi doubt hoga to uska <b>PROOF</b> dena padega. 🔎
+
+<b>9️⃣ PANEL / H4CK</b>
+Agar koi panel/h4ck laga ke aayega to usko kuch nahi milega — <b>NO REFUND + NO PRIZE</b>. Baaki player ko 2nd karaya jayega. ❌
+
+<b>🔟 REPLAY ON</b>
+Game mein <b>REPLAY ON rahega.</b> 🎥🔥
+
+<b>🔥 FX BR TOURNAMENT 🔥</b>
+Rules follow karo — Fair Play rakho! 🫶"""
+    await message.answer(get_setting("rules", default_rules), parse_mode="HTML")
 
 
 @dp.message(F.text == "🏆 Results")
 async def results(message: Message):
     r = active_round()
-    if r and r["results"]:
-        await message.answer(r["results"])
+    text = (r["results"] if r and r["results"] else get_setting("results", ""))
+    image_id = (r["results_image_file_id"] if r and r["results_image_file_id"] else get_setting("results_image_file_id", ""))
+    if text and image_id:
+        await message.answer_photo(image_id, caption=text)
+    elif image_id:
+        await message.answer_photo(image_id)
+    elif text:
+        await message.answer(text)
     else:
-        await message.answer(get_setting("results", "🏆 Results abhi publish nahi hua."))
+        await message.answer("🏆 Results abhi publish nahi hua.")
 
 
 # ---------- ADMIN PANEL ----------
@@ -547,27 +582,77 @@ async def set_room_save(message: Message, state: FSMContext):
     )
 
 
+@dp.message(F.text == "📜 Set Rules")
+async def set_rules_start(message: Message, state: FSMContext):
+    if not admin_only(message):
+        return
+    await state.set_state(Admin.rules)
+    await message.answer("📜 Naye Rules ka poora text bhejo:")
+
+
+@dp.message(Admin.rules)
+async def set_rules_save(message: Message, state: FSMContext):
+    if not admin_only(message):
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("❗ Rules ka text bhejo.")
+        return
+    set_setting("rules", text)
+    await state.clear()
+    await message.answer("✅ Rules save ho gaya.", reply_markup=admin_menu())
+
+
 @dp.message(F.text == "🏆 Set Results")
 async def set_results_start(message: Message, state: FSMContext):
     if not admin_only(message):
         return
     await state.set_state(Admin.results)
-    await message.answer("🏆 Results ka text bhejo:")
+    await message.answer("""🏆 Results set karo.
+
+Option 1: Sirf text bhejo.
+Option 2: Result image bhejo aur caption me result text likho.
+Option 3: Sirf image bhejo.""")
+
+
+@dp.message(Admin.results, F.photo)
+async def set_results_photo(message: Message, state: FSMContext):
+    if not admin_only(message):
+        return
+    r = active_round()
+    text = (message.caption or "").strip()
+    image_id = message.photo[-1].file_id
+    conn.execute(
+        "UPDATE match_rounds SET results=?, results_image_file_id=? WHERE id=?",
+        (text, image_id, r["id"]),
+    )
+    conn.commit()
+    set_setting("results", text)
+    set_setting("results_image_file_id", image_id)
+    await state.clear()
+    await message.answer("✅ Results text + image save ho gaya.", reply_markup=admin_menu())
 
 
 @dp.message(Admin.results)
 async def set_results_save(message: Message, state: FSMContext):
     if not admin_only(message):
         return
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("❗ Results ka text bhejo, ya result image caption ke saath bhejo.")
+        return
     r = active_round()
     conn.execute(
         "UPDATE match_rounds SET results=? WHERE id=?",
-        (message.text or "", r["id"]),
+        (text, r["id"]),
     )
     conn.commit()
-    set_setting("results", message.text or "")
+    conn.execute("UPDATE match_rounds SET results_image_file_id=? WHERE id=?", ("", r["id"]))
+    conn.commit()
+    set_setting("results", text)
+    set_setting("results_image_file_id", "")
     await state.clear()
-    await message.answer("✅ Results save ho gaya.", reply_markup=admin_menu())
+    await message.answer("✅ Results text save ho gaya.", reply_markup=admin_menu())
 
 
 # ---------- MANAGE REGISTRATIONS ----------
